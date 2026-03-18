@@ -2,7 +2,7 @@
   "llm": {
     "provider": "openai",
     "model": "gpt-4o",
-    "max_tokens": 500
+    "max_tokens": 1024
   },
   "embedding": {
     "model": "BAAI/bge-base-en-v1.5"
@@ -19,7 +19,8 @@
     ],
     "num_question_centric": 5,
     "schema_centric_num_paths": 3,
-    "schema_centric_examples_per_path": 1
+    "schema_centric_examples_per_path": 1,
+    "num_semantic": 3
   },
   "scoring": {
     "weights": [0.4, 0.4, 0.2],
@@ -28,7 +29,7 @@
   "generation": {
     "top_k": 3,
     "num_candidates": 3,
-    "evaluation_mode": "general",
+    "evaluation_mode": "spider",
     "token_budget": 2000,
     "use_diversity": true,
     "diversity_threshold": 0.3,

@@ -27,7 +27,7 @@ class OpenAIClient(LLMClient):
         self.model = model
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def generate(self, prompt: str, max_tokens: int = 500) -> str:
+    def generate(self, prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -35,7 +35,8 @@ class OpenAIClient(LLMClient):
                 {"role": "user", "content": prompt}
             ],
             max_tokens=max_tokens,
-            temperature=0.0
+            temperature=temperature,
+            seed=42
         )
         return response.choices[0].message.content
 

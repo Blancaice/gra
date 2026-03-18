@@ -14,24 +14,18 @@ def build_prompt(schema: Dict, examples: List[Dict], user_question: str) -> str:
     prompt_parts.append(
         "You are a SQL expert.\n"
         "Generate exactly one SQLite SELECT query for the user question.\n"
-        "Output SQL only.\n"
-        "Style constraints for evaluation:\n"
-        "1) Keep SQL minimal and canonical.\n"
-        "2) Do not add trailing semicolon.\n"
-        "3) Do not add aliases unless required for disambiguation.\n"
-        "4) Do not add extra selected columns, ORDER BY, GROUP BY, LIMIT, or conditions unless required.\n"
-        "5) Prefer the simplest correct SQL.\n"
-        "6) Use only table and column names that appear in the provided schema.\n"
-        "7) Do not invent identifiers (forbidden: guessed table/column names).\n"
-        "8) IMPORTANT: Use the column description (after '--') to identify the correct column, "
-        "but ALWAYS use the exact column identifier (before the type) in your SQL, never the description text. "
-        "9) For 'youngest/oldest/highest/lowest' queries, use ORDER BY + LIMIT 1 instead of subqueries with MIN/MAX.\n"
-        "10) For set operations (both X and Y), use INTERSECT instead of AND/OR.\n"
-        "11) For exclusion (not in X), use EXCEPT or NOT IN as appropriate.\n"
-        "12) Only add WHERE conditions explicitly mentioned in the question.\n"
-        "13) For counting related items per group, use JOIN + GROUP BY + COUNT(*), not correlated subqueries.\n"
-        "14) IMPORTANT: If a table or column name contains spaces or special characters, "
-        "wrap it in backticks (e.g., `Life Expectancy`, `Government Form`).\n"
+        "Output SQL only.\n\n"
+        "Guidelines:\n"
+        "1) Use only table and column names from the provided schema. "
+        "Use the column description (after '--') to identify the correct column, "
+        "but write the exact column identifier in your SQL.\n"
+        "2) Only add WHERE conditions, JOINs, GROUP BY, ORDER BY that the question requires. "
+        "Prefer the simplest correct SQL.\n"
+        "3) When the question asks for entities satisfying multiple conditions on DIFFERENT rows "
+        "of the same table, consider whether INTERSECT or EXCEPT is needed instead of AND/OR in WHERE.\n"
+        "4) For 'youngest/oldest/highest/lowest' queries, prefer ORDER BY + LIMIT 1.\n"
+        "5) Before choosing GROUP BY columns, ask yourself: should rows be grouped by identity (ID) "
+        "or by a descriptive attribute?\n"
     )
 
     prompt_parts.append("# Database Schema\n")
@@ -86,15 +80,19 @@ def format_schema(schema: Dict) -> str:
 
     return "\n".join(lines)
 
-
+#已弃用
 def build_prompt_with_cot(schema: Dict, examples: List[Dict], user_question: str) -> str:
     prompt = build_prompt(schema, examples, user_question)
     cot_instruction = """
 Before generating the SQL, think step by step:
-1. Identify the relevant tables
-2. Determine the JOIN conditions
-3. Specify the WHERE conditions
-4. Add aggregations only if needed
+1. What is the question asking for? Identify the target columns to SELECT.
+2. Which tables contain the needed data? List them.
+3. How do these tables connect? Determine JOIN conditions using foreign keys.
+4. What filtering is needed? Identify WHERE conditions from the question.
+5. Does the question need aggregation (COUNT, SUM, AVG, MAX, MIN)? If so, what GROUP BY is needed?
+6. Does the question need ordering or limiting results (top/bottom/highest/lowest)?
+7. Does the question involve set operations (both X and Y → INTERSECT, not in X → EXCEPT)?
+8. Double-check: are all table and column names from the schema above?
 
 Now generate the SQL query:
 """

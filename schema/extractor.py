@@ -5,6 +5,8 @@ Schema 提取模块
 
 import sqlite3
 import json
+import os
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -140,3 +142,94 @@ def build_schema_graph(schema: Dict) -> Dict:
             graph[to_table].append(from_table)
 
     return graph
+
+
+def _sample_column_values(db_path: str, table_name: str, col_name: str, limit: int = 5) -> List[str]:
+    """采样列的非空去重值"""
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        cursor = conn.cursor()
+        cursor.execute(
+            f'SELECT DISTINCT "{col_name}" FROM "{table_name}" '
+            f'WHERE "{col_name}" IS NOT NULL LIMIT {limit}'
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        return [str(r[0]) for r in rows if r[0] is not None]
+    except Exception:
+        return []
+
+
+def generate_column_descriptions(
+    db_path: str,
+    schema: Dict,
+    llm_client,
+    cache_dir: str = "data/cache",
+) -> Dict[str, Dict[str, str]]:
+    """
+    为数据库的所有列生成自然语言描述，带磁盘缓存。
+    一次 LLM 调用覆盖整个 db 的所有列。
+
+    Returns:
+        {table_name: {col_name: description}}
+    """
+    db_id = Path(db_path).stem
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"col_desc_{db_id}.json")
+
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    # 构建 schema + 采样值的描述
+    lines = []
+    for table in schema.get("tables", []):
+        tname = table["name"]
+        for col in table.get("columns", []):
+            cname = col["name"]
+            ctype = col.get("type", "")
+            samples = _sample_column_values(db_path, tname, cname, limit=5)
+            sample_str = ", ".join(samples[:5]) if samples else "(empty)"
+            lines.append(f"{tname}.{cname} ({ctype}) samples: [{sample_str}]")
+
+    if not lines:
+        return {}
+
+    schema_block = "\n".join(lines)
+    prompt = f"""Given the following database columns with their types and sample values, generate a short natural language description for each column. The description should explain what the column stores in plain English.
+
+{schema_block}
+
+Return ONLY a JSON object in this exact format (no markdown, no explanation):
+{{"table_name": {{"column_name": "description"}}}}
+"""
+
+    try:
+        response = llm_client.generate(prompt, max_tokens=2000)
+        json_match = re.search(r"\{[\s\S]*\}", response)
+        if json_match:
+            desc_map = json.loads(json_match.group())
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(desc_map, f, ensure_ascii=False, indent=2)
+            return desc_map
+    except Exception as exc:
+        print(f"  Column description generation failed: {exc}")
+
+    return {}
+
+
+def enrich_schema_with_descriptions(
+    schema: Dict,
+    desc_map: Dict[str, Dict[str, str]],
+) -> Dict:
+    """将生成的列描述注入到 schema 中（仅填充缺失的 description）"""
+    for table in schema.get("tables", []):
+        tname = table["name"]
+        table_descs = desc_map.get(tname, {})
+        for col in table.get("columns", []):
+            if not col.get("description"):
+                desc = table_descs.get(col["name"], "")
+                if desc:
+                    col["description"] = desc
+    return schema
