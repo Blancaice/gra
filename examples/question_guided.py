@@ -1,49 +1,99 @@
 """
-Question-guided column mapping.
+Question-guided semantic example generation.
 
-让 LLM 分析用户问题中的关键概念对应 schema 中的哪些表和列，
-输出映射分析文本，拼入最终 SQL 生成 prompt 辅助消歧。
+根据用户问题 + pruned schema，让 LLM 生成语义相近的 question-SQL 示例对，
+作为 few-shot 候选进入 scoring 流程。
 """
 
 import json
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List
+
+from src.examples.example_validator import validate_generated_examples
+from src.examples.schema_centric import classify_sql_complexity
 
 
-def generate_column_mapping(
+def generate_semantic_examples(
     question: str,
     pruned_schema: Dict,
     llm_client,
-) -> str:
+    db_path: str = None,
+    num_examples: int = 3,
+) -> List[Dict]:
     """
-    让 LLM 分析问题关键词与 schema 列的映射关系。
-    返回映射分析文本，供最终 prompt 使用。
+    用 LLM 根据用户问题语义 + schema 生成相近的 question-SQL 示例。
+
+    Returns:
+        标准格式的示例列表，经过 schema/执行验证。
     """
     if not pruned_schema.get("tables"):
-        return ""
+        return []
 
     schema_str = _format_schema_compact(pruned_schema)
 
-    prompt = f"""Given the database schema and user question below, identify which tables and columns are needed to answer the question.
+    prompt = f"""You are a SQL expert. Given the database schema and a user question, generate {num_examples} similar but different question-SQL pairs that exercise the same tables and similar query patterns.
 
-For each key concept in the question, map it to the exact column name from the schema. If multiple columns have similar names, explain which one is correct and why.
-
-Be concise. Output only the mapping, one per line, format:
-"<concept>" -> <table>.<column>
-
-## Schema
+Database Schema:
 {schema_str}
 
-## Question
-{question}
+User Question: {question}
+
+Requirements:
+1. Each generated question should be semantically related to the user question (similar topic, similar tables, similar complexity).
+2. SQL must be valid SQLite and use ONLY tables/columns from the schema above.
+3. Cover slightly different query patterns (e.g., different aggregations, filters, or joins).
+4. Do NOT generate the exact same question as the user question.
+5. Return ONLY a JSON array, no explanation:
+[{{"question":"...","sql":"...","reasoning":"..."}}]
 """
 
     try:
-        response = llm_client.generate(prompt, max_tokens=300)
-        return (response or "").strip()
+        response = llm_client.generate(prompt, max_tokens=2000)
+        parsed = _parse_examples(response)
+
+        valid_examples, _ = validate_generated_examples(
+            parsed,
+            schema=pruned_schema,
+            db_path=db_path,
+            keep_complex_on_exec_fail=False,
+            reject_empty_result=True,
+            sample_limit=5,
+        )
+        return valid_examples if valid_examples else parsed[:num_examples]
     except Exception as exc:
-        print(f"  Column mapping failed: {exc}")
-        return ""
+        print(f"  Semantic example generation failed: {exc}")
+        return []
+
+
+def _parse_examples(response: str) -> List[Dict]:
+    """从 LLM 响应中解析示例 JSON 数组。"""
+    json_match = re.search(r"\[[\s\S]*\]", response or "")
+    if not json_match:
+        return []
+
+    try:
+        items = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return []
+
+    results = []
+    for item in items:
+        if not isinstance(item, dict) or "question" not in item or "sql" not in item:
+            continue
+        q = (item.get("question") or "").strip()
+        sql = (item.get("sql") or "").strip()
+        if not q or not sql:
+            continue
+        token_count = len(q) // 4 + len(sql) // 4 + 20
+        results.append({
+            "question": q,
+            "sql": sql,
+            "reasoning": (item.get("reasoning") or "").strip(),
+            "source": "semantic",
+            "token_count": token_count,
+            "complexity_tag": classify_sql_complexity(sql),
+        })
+    return results
 
 
 def _format_schema_compact(schema: Dict) -> str:
@@ -53,7 +103,11 @@ def _format_schema_compact(schema: Dict) -> str:
         cols = []
         for c in table.get("columns", []):
             pk = " [PK]" if c.get("primary_key") else ""
-            cols.append(f"{c['name']} ({c['type']}{pk})")
+            desc = c.get("description", "")
+            if desc and desc.lower() != c["name"].lower():
+                cols.append(f"{c['name']} ({c['type']}{pk}) -- {desc}")
+            else:
+                cols.append(f"{c['name']} ({c['type']}{pk})")
         lines.append(f"{table['name']}: {', '.join(cols)}")
 
     if schema.get("foreign_keys"):

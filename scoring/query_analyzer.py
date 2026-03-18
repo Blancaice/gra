@@ -62,26 +62,20 @@ def dynamic_weights(profile: Dict) -> Dict:
 
     if level == "low":
         return {
-            "nl": 0.45,
+            "nl": 0.50,
             "sql": 0.35,
-            "ast": 0.08,
-            "schema": 0.17,
-            "token_cost": 0.05,
+            "ast": 0.15,
         }
     if level == "high":
         return {
-            "nl": 0.25,
+            "nl": 0.30,
             "sql": 0.35,
-            "ast": 0.22,
-            "schema": 0.23,
-            "token_cost": 0.05,
+            "ast": 0.35,
         }
     return {
-        "nl": 0.35,
+        "nl": 0.40,
         "sql": 0.35,
-        "ast": 0.15,
-        "schema": 0.20,
-        "token_cost": 0.05,
+        "ast": 0.25,
     }
 
 

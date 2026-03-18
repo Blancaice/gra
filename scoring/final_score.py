@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .ast_score import compute_ast_match_score, compute_ast_score, get_sql_features
+from .ast_score import compute_ast_match_score, compute_ast_score
 from .query_analyzer import analyze_question, dynamic_weights
 from .schema_link_score import compute_schema_link_score
 from .semantic_score import compute_nl_score_from_embeddings
@@ -72,17 +72,11 @@ def compute_final_score(
     ast_match_score = compute_ast_match_score(user_question, example_sql)
     # AST分融合：复杂度保留，结构对齐权重更高。
     ast_score = 0.4 * ast_complexity_score + 0.6 * ast_match_score
-    sql_features = get_sql_features(example_sql)
-    structure_match = structure_match_score(profile, sql_features)
-    schema_overlap = compute_schema_overlap(example_sql, example, relevant_tables)
-    token_cost = token_cost_penalty(example)
 
     final_score = (
         weight_policy["nl"] * nl_score
         + weight_policy["sql"] * sql_score
         + weight_policy["ast"] * ast_score
-        + weight_policy["schema"] * ((structure_match + schema_overlap) / 2.0)
-        - weight_policy["token_cost"] * token_cost
     )
     return max(0.0, min(1.0, float(final_score)))
 
@@ -119,15 +113,6 @@ def score_all_examples(
         )
         item = example.copy()
         item["score"] = score
-        item["nl_link_score"] = compute_schema_link_score(
-            user_question=user_question,
-            example_question=example.get("question", ""),
-            schema=relevant_schema or {},
-        )
-        item["ast_match_score"] = compute_ast_match_score(
-            user_question=user_question,
-            example_sql=example.get("sql", ""),
-        )
         scored_examples.append(item)
 
     scored_examples.sort(key=lambda x: x.get("score", 0.0), reverse=True)
@@ -213,8 +198,6 @@ def _resolve_weight_policy(
             "nl": static[0],
             "sql": static[1],
             "ast": static[2],
-            "schema": 0.0,
-            "token_cost": 0.0,
         }
     return dynamic_weights(profile)
 
