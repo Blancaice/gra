@@ -21,7 +21,7 @@ from src.generation.generator import (
     execute_with_repair,
 )
 from src.generation.prompt_builder import build_prompt
-from src.generation.schema_linker import link_schema
+from src.generation.schema_linker import link_schema, is_complex_question
 from src.generation.selector import select_top_k_examples
 from src.schema.extractor import build_schema_graph, extract_schema
 from src.schema.indexer import SchemaIndexer
@@ -92,6 +92,20 @@ class TextToSQLPipeline:
         )
         print(f"  Selected {len(pruned_schema['tables'])} tables")
 
+        # Step 1.5: 复杂查询触发 schema linking
+        schema_hints = None
+        if self.config.get("schema_linking.enabled", True) and is_complex_question(question):
+            print("  Step 1.5: Complex question detected, triggering schema linking...")
+            schema_hints = link_schema(
+                question=question,
+                pruned_schema=pruned_schema,
+                llm_client=self.llm_client,
+            )
+            if schema_hints:
+                print(f"  Linked tables: {schema_hints.get('tables', [])}")
+            else:
+                print("  Schema linking returned no hints")
+
         print("Step 2: Retrieving examples...")
         qc_examples = []
         sc_examples = []
@@ -106,19 +120,21 @@ class TextToSQLPipeline:
             )
 
         # Schema-centric: Query-guided Path Sampling + LLM 生成
-        try:
-            pruned_graph = build_schema_graph(pruned_schema)
-            sc_examples = retrieve_schema_centric(
-                pruned_schema=pruned_schema,
-                schema_graph=pruned_graph,
-                llm_client=self.llm_client,
-                user_question=question,
-                num_paths=self.config.get("examples.schema_centric_num_paths", 3),
-                examples_per_path=self.config.get("examples.schema_centric_examples_per_path", 1),
-                db_path=self.db_path,
-            )
-        except Exception as exc:
-            print(f"  Schema-centric generation failed: {exc}")
+        if self.config.get("examples.use_schema_centric", True):
+            try:
+                pruned_graph = build_schema_graph(pruned_schema)
+                sc_examples = retrieve_schema_centric(
+                    pruned_schema=pruned_schema,
+                    schema_graph=pruned_graph,
+                    llm_client=self.llm_client,
+                    user_question=question,
+                    num_paths=self.config.get("examples.schema_centric_num_paths", 3),
+                    examples_per_path=self.config.get("examples.schema_centric_examples_per_path", 1),
+                    db_path=self.db_path,
+                    schema_hints=schema_hints,
+                )
+            except Exception as exc:
+                print(f"  Schema-centric generation failed: {exc}")
 
         online_examples = merge_examples([qc_examples, sc_examples])
         print(
@@ -163,20 +179,6 @@ class TextToSQLPipeline:
             print("Step 3: No examples available; continue with zero-shot prompt.")
 
         print("Step 4: Building prompt...")
-        # Schema linking: LLM 精确识别所需表/列/JOIN（仅 medium/high 触发）
-        schema_hints = None
-        if self.config.get("schema_linking.enabled", True):
-            print("  Step 3.5: Schema linking via LLM...")
-            schema_hints = link_schema(
-                question=question,
-                pruned_schema=pruned_schema,
-                llm_client=self.llm_client,
-            )
-            if schema_hints:
-                print(f"  Linked tables: {schema_hints.get('tables', [])}")
-            else:
-                print("  Schema linking returned no hints, using default prompt")
-
         prompt = build_prompt(pruned_schema, selected_examples, question, schema_hints=schema_hints)
 
         print("Step 5: Generating SQL...")

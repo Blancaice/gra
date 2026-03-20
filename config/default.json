@@ -1,18 +1,18 @@
 {
   "llm": {
     "provider": "openai",
-    "model": "gpt-4o",
-    "max_tokens": 500
+    "model": "gpt-4o"
   },
   "embedding": {
     "model": "BAAI/bge-base-en-v1.5"
   },
   "schema": {
     "top_k": 5,
-    "max_hops": 1
+    "max_hops": 2
   },
   "examples": {
     "use_train_retrieval": true,
+    "use_schema_centric": false,
     "train_data_paths": [
       "data/spider_data/train_spider.json",
       "data/spider_data/train_others.json"
@@ -24,6 +24,9 @@
   "scoring": {
     "weights": [0.4, 0.4, 0.2],
     "dynamic_enabled": true
+  },
+  "schema_linking": {
+    "enabled": true
   },
   "generation": {
     "top_k": 3,
