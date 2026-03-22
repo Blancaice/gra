@@ -45,11 +45,27 @@ def check_empty_result_and_repair(
     db_path: str,
     llm_client,
     evaluation_mode: str = "general",
+    min_complexity: str = "high",
 ) -> Optional[str]:
     """
     零结果自检：如果 SQL 返回空，检查 WHERE 条件中的值是否存在，不存在则修复
+
+    Args:
+        min_complexity: 最小复杂度要求 ("low", "medium", "high")，默认只对 high 触发
+
     Returns: 修复后的 SQL，如果不需要修复则返回 None
     """
+    from src.scoring.query_analyzer import analyze_question
+
+    # 复杂度检查
+    if min_complexity != "low":
+        query_profile = analyze_question(user_question)
+        complexity_order = {"low": 0, "medium": 1, "high": 2}
+        question_level = complexity_order.get(query_profile.get("complexity_level", "low"), 0)
+        required_level = complexity_order.get(min_complexity, 2)
+
+        if question_level < required_level:
+            return None
     # 1. 执行 SQL
     try:
         conn = sqlite3.connect(db_path)
