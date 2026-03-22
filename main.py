@@ -12,6 +12,7 @@ load_dotenv()
 
 from src.examples.retriever import load_train_data, retrieve_question_centric, retrieve_schema_centric
 from src.examples.storage import load_examples, merge_examples
+from src.examples.structure_retriever import StructureAwareRetriever
 from src.generation.generator import (
     generate_sql,
     generate_sql_candidates,
@@ -67,6 +68,15 @@ class TextToSQLPipeline:
         else:
             self.train_data = []
 
+        # 初始化结构感知检索器
+        self.structure_retriever = None
+        if self.config.get("examples.use_structure_aware", True) and self.train_data:
+            print("Building structure-aware retriever...")
+            self.structure_retriever = StructureAwareRetriever(
+                cache_dir=self.config.get("examples.cache_dir", "data/cache"),
+            )
+            self.structure_retriever.build(self.train_data, self.vectorizer)
+
         # 提取 db_id
         self.db_id = os.path.splitext(os.path.basename(db_path))[0]
 
@@ -89,8 +99,10 @@ class TextToSQLPipeline:
             self.schema_graph,
             self.schema,
             top_k=self.config.get("schema.top_k", 5),
+            query_profile=query_profile,
         )
-        print(f"  Selected {len(pruned_schema['tables'])} tables")
+        retrieved_tables = [t["name"] for t in pruned_schema.get("tables", [])]
+        print(f"  Selected {len(retrieved_tables)} tables: {', '.join(retrieved_tables)}")
 
         # Step 1.5: 复杂查询触发 schema linking
         schema_hints = None
@@ -109,38 +121,31 @@ class TextToSQLPipeline:
         print("Step 2: Retrieving examples...")
         qc_examples = []
         sc_examples = []
-        # Question-centric: 训练集 embedding 检索
-        if self.config.get("examples.use_train_retrieval", True) and self.train_data:
-            qc_examples = retrieve_question_centric(
+        sa_examples = []  # structure-aware
+
+        # 自适应 alpha：简单问题偏语义，复杂问题偏结构
+        complexity = query_profile.get("complexity_level", "medium")
+        adaptive_alpha = {"low": 0.40, "medium": 0.50, "high": 0.60}.get(
+            complexity, self.config.get("examples.structure_alpha", 0.4)
+        )
+
+        # Structure-aware retrieval（核心创新：零 LLM 成本）
+        if self.structure_retriever is not None:
+            sa_examples = self.structure_retriever.retrieve(
                 question=question,
                 vectorizer=self.vectorizer,
-                train_data=self.train_data,
-                db_id=self.db_id,
-                top_n=self.config.get("examples.num_question_centric", 6),
+                top_n=self.config.get("examples.num_structure_aware", 10),
+                alpha=adaptive_alpha,
+                semantic_candidates=self.config.get("examples.semantic_candidates", 200),
             )
+            print(f"  Structure-aware retrieved: {len(sa_examples)} (alpha={adaptive_alpha:.2f}, complexity={complexity})")
+            if sa_examples:
+                top = sa_examples[0]
+                print(f"    Top: struct={top['structure_score']:.3f} sem={top['semantic_score']:.3f} "
+                      f"combined={top['combined_score']:.3f}")
 
-        # Schema-centric: Query-guided Path Sampling + LLM 生成
-        if self.config.get("examples.use_schema_centric", True):
-            try:
-                pruned_graph = build_schema_graph(pruned_schema)
-                sc_examples = retrieve_schema_centric(
-                    pruned_schema=pruned_schema,
-                    schema_graph=pruned_graph,
-                    llm_client=self.llm_client,
-                    user_question=question,
-                    num_paths=self.config.get("examples.schema_centric_num_paths", 3),
-                    examples_per_path=self.config.get("examples.schema_centric_examples_per_path", 1),
-                    db_path=self.db_path,
-                    schema_hints=schema_hints,
-                )
-            except Exception as exc:
-                print(f"  Schema-centric generation failed: {exc}")
-
-        online_examples = merge_examples([qc_examples, sc_examples])
-        print(
-            f"  Retrieved examples: question_centric={len(qc_examples)}, "
-            f"schema_centric={len(sc_examples)}, merged={len(online_examples)}"
-        )
+        online_examples = sa_examples
+        #print(f"  Retrieved examples: {len(online_examples)} (structure-aware)")
 
         # Prefer online examples by default; optionally merge with loaded library.
         if self.config.get("examples.use_loaded_examples", False) and self.examples:
@@ -156,16 +161,27 @@ class TextToSQLPipeline:
             print("Step 3: Scoring and selecting examples...")
             relevant_tables = [t["name"] for t in pruned_schema.get("tables", [])]
 
-            scored_examples = score_all_examples(
-                user_question=question,
-                examples=candidate_examples,
-                llm_client=self.llm_client,
-                vectorizer=self.vectorizer,
-                weights=self.config.get("scoring.weights"),
-                relevant_schema=pruned_schema,
-                relevant_tables=relevant_tables,
-                dynamic_enabled=self.config.get("scoring.dynamic_enabled", True),
-            )
+            # 结构感知检索的 examples 已有 combined_score，
+            # 直接用轻量评分（无 LLM 调用），不走原来的重打分
+            if sa_examples:
+                scored_examples = _lightweight_rescore(
+                    user_question=question,
+                    examples=candidate_examples,
+                    vectorizer=self.vectorizer,
+                    relevant_schema=pruned_schema,
+                    relevant_tables=relevant_tables,
+                )
+            else:
+                scored_examples = score_all_examples(
+                    user_question=question,
+                    examples=candidate_examples,
+                    llm_client=self.llm_client,
+                    vectorizer=self.vectorizer,
+                    weights=self.config.get("scoring.weights"),
+                    relevant_schema=pruned_schema,
+                    relevant_tables=relevant_tables,
+                    dynamic_enabled=self.config.get("scoring.dynamic_enabled", True),
+                )
 
             selected_examples = select_top_k_examples(
                 scored_examples=scored_examples,
@@ -178,8 +194,22 @@ class TextToSQLPipeline:
         else:
             print("Step 3: No examples available; continue with zero-shot prompt.")
 
+        # 获取结构预测（用于 prompt hint）
+        structure_hints = None
+        if self.structure_retriever is not None and sa_examples:
+            q_emb = self.vectorizer.model.encode(question, convert_to_numpy=True)
+            pred_proba = self.structure_retriever.predict_structure_proba(q_emb)
+            from src.examples.structure_retriever import FEATURE_NAMES
+            structure_hints = {fname: float(pred_proba[i]) for i, fname in enumerate(FEATURE_NAMES)}
+        
+
         print("Step 4: Building prompt...")
-        prompt = build_prompt(pruned_schema, selected_examples, question, schema_hints=schema_hints)
+        include_values = self.config.get("generation.include_values", False)
+        prompt = build_prompt(
+            pruned_schema, selected_examples, question,
+            schema_hints=schema_hints, structure_hints=structure_hints,
+            db_path=self.db_path, include_values=include_values,
+        )
 
         print("Step 5: Generating SQL...")
         num_candidates = self.config.get("generation.num_candidates", 1)
@@ -222,6 +252,8 @@ class TextToSQLPipeline:
 
         # Step 6: 语义验证 + 执行验证 + 错误修正
         print("Step 6: Verify and repair...")
+        use_semantic_verify = self.config.get("generation.semantic_verify", True)
+        use_value_check = self.config.get("generation.value_check", True)
         sql, exec_ok = execute_with_repair(
             sql=sql,
             user_question=question,
@@ -230,6 +262,8 @@ class TextToSQLPipeline:
             llm_client=self.llm_client,
             evaluation_mode=evaluation_mode,
             max_retries=3,
+            semantic_verify=use_semantic_verify,
+            value_check=use_value_check,
         )
         if exec_ok:
             print("  SQL execution verified OK")
@@ -237,6 +271,82 @@ class TextToSQLPipeline:
             print("  SQL execution failed after repair attempts")
 
         return sql
+
+
+def _merge_and_deduplicate(*example_lists):
+    """合并多个检索源的 examples，按 question+sql 去重。"""
+    seen = set()
+    merged = []
+    for examples in example_lists:
+        for ex in (examples or []):
+            key = (ex.get("question", ""), ex.get("sql", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            if "combined_score" not in ex:
+                dist = ex.get("distance", 1.0)
+                ex["combined_score"] = max(0.0, 1.0 - dist / 2.0)
+                ex["structure_score"] = 0.0
+                ex["semantic_score"] = ex["combined_score"]
+            merged.append(ex)
+    return merged
+
+
+def _lightweight_rescore(
+    user_question: str,
+    examples,
+    vectorizer,
+    relevant_schema=None,
+    relevant_tables=None,
+):
+    """
+    轻量评分：零 LLM 调用。
+    融合检索阶段的 combined_score + AST 结构对齐 + schema 重叠度。
+    """
+    from src.scoring.ast_score import compute_ast_match_score
+    from src.scoring.schema_link_score import compute_schema_link_score
+    from src.scoring.final_score import compute_schema_overlap, token_cost_penalty
+
+    scored = []
+    for ex in examples:
+        # 检索阶段的融合分（结构 + 语义）
+        retrieval_score = float(ex.get("combined_score", ex.get("score", 0.5)))
+
+        # AST 结构对齐（NL 问题 vs example SQL，纯规则，无 LLM）
+        ast_match = compute_ast_match_score(user_question, ex.get("sql", ""))
+
+        # Schema 链接重合度（embedding 匹配，无 LLM）
+        nl_link = compute_schema_link_score(
+            user_question=user_question,
+            example_question=ex.get("question", ""),
+            schema=relevant_schema or {},
+            vectorizer=vectorizer,
+        )
+
+        # Schema 表重叠度
+        schema_overlap = compute_schema_overlap(ex.get("sql", ""), ex, relevant_tables)
+
+        # Token 成本惩罚
+        token_cost = token_cost_penalty(ex)
+
+        # 加权融合
+        score = (
+            0.45 * retrieval_score
+            + 0.20 * ast_match
+            + 0.15 * nl_link
+            + 0.15 * schema_overlap
+            - 0.05 * token_cost
+        )
+
+        item = ex.copy()
+        item["score"] = max(0.0, min(1.0, score))
+        item["retrieval_score"] = retrieval_score
+        item["ast_match_score"] = ast_match
+        item["nl_link_score"] = nl_link
+        scored.append(item)
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored
 
 
 def main():

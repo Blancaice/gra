@@ -13,11 +13,16 @@
   "examples": {
     "use_train_retrieval": true,
     "use_schema_centric": false,
+    "use_structure_aware": true,
     "train_data_paths": [
       "data/spider_data/train_spider.json",
       "data/spider_data/train_others.json"
     ],
     "num_question_centric": 5,
+    "num_structure_aware": 10,
+    "structure_alpha": 0.4,
+    "semantic_candidates": 100,
+    "cache_dir": "data/cache",
     "schema_centric_num_paths": 3,
     "schema_centric_examples_per_path": 1
   },
@@ -26,7 +31,7 @@
     "dynamic_enabled": true
   },
   "schema_linking": {
-    "enabled": true
+    "enabled": false
   },
   "generation": {
     "top_k": 3,

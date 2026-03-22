@@ -5,7 +5,9 @@ Prompt construction for SQL generation.
 from typing import Dict, List
 
 
-def build_prompt(schema: Dict, examples: List[Dict], user_question: str) -> str:
+def build_prompt(schema: Dict, examples: List[Dict], user_question: str,
+                 schema_hints: Dict = None, structure_hints: Dict = None,
+                 db_path: str = None, include_values: bool = False) -> str:
     """
     Build final prompt with Spider-friendly canonical SQL constraints.
     """
@@ -24,19 +26,38 @@ def build_prompt(schema: Dict, examples: List[Dict], user_question: str) -> str:
         "6) Use only table and column names that appear in the provided schema.\n"
         "7) Do not invent identifiers (forbidden: guessed table/column names).\n"
         "8) IMPORTANT: Use the column description (after '--') to identify the correct column, "
-        "but ALWAYS use the exact column identifier (before the type) in your SQL, never the description text. "
-        "9) For 'youngest/oldest/highest/lowest' queries, use ORDER BY + LIMIT 1 instead of subqueries with MIN/MAX.\n"
-        "10) For set operations (both X and Y), use INTERSECT instead of AND/OR.\n"
-        "11) For exclusion (not in X), use EXCEPT or NOT IN as appropriate.\n"
-        "12) Only add WHERE conditions explicitly mentioned in the question.\n"
-        "13) For counting related items per group, use JOIN + GROUP BY + COUNT(*), not correlated subqueries.\n"
-        "14) IMPORTANT: If a table or column name contains spaces or special characters, "
-        "wrap it in backticks (e.g., `Life Expectancy`, `Government Form`).\n"
+        "but ALWAYS use the exact column identifier (before the type) in your SQL, never the description text.\n"
+        "9) For 'youngest/oldest/highest/lowest' queries, prefer MAX/MIN aggregation over ORDER BY + LIMIT when possible.\n"
+        "10) For counting, use COUNT(*) unless the question specifically asks to count a particular column.\n"
+        "11) For multiple OR conditions on the same column (e.g., year = 1948 OR year = 1949), write them as separate OR clauses, not IN.\n"
+        "12) For GROUP BY, group by the column the question asks about (usually a name/description column, not an ID).\n"
+        "13) CRITICAL: Only add WHERE conditions explicitly mentioned in the question. Do NOT add:\n"
+        "    - NULL checks (IS NULL, IS NOT NULL) unless the question mentions 'null', 'missing', 'empty'\n"
+        "    - Date filters unless the question specifies a date range\n"
+        "    - Status/state filters unless explicitly asked\n"
+        "14) CRITICAL: Do NOT fabricate literal values in WHERE clauses. If the question uses pronouns like 'this type',"
+        " it refers to values that exist in the data, not literal strings. You must JOIN tables to resolve such references.\n"
+        "15) For exclusion (not in X), use NOT IN with a subquery.\n"
+        "16) For set operations (both X and Y), use INTERSECT only when combining two complete SELECT queries.\n"
+        "17) IMPORTANT: If a table or column name contains spaces or special characters, "
+        "wrap it in backticks.\n"
     )
 
     prompt_parts.append("# Database Schema\n")
-    prompt_parts.append(format_schema(schema))
+    prompt_parts.append(format_schema(schema, db_path=db_path, include_values=include_values))
     prompt_parts.append("\n")
+
+    if schema_hints:
+        from src.generation.schema_linker import format_schema_hints
+        prompt_parts.append("# Schema Analysis\n")
+        prompt_parts.append(format_schema_hints(schema_hints))
+        prompt_parts.append("\n")
+
+    # 结构预测提示：告诉 LLM 这个问题可能需要什么 SQL 结构
+    if structure_hints:
+        prompt_parts.append("# Predicted SQL Structure (use as guidance, not as strict rules)\n")
+        prompt_parts.append(format_structure_hints(structure_hints))
+        prompt_parts.append("\n")
 
     if examples:
         prompt_parts.append("# Example Questions and SQL Queries\n")
@@ -53,6 +74,30 @@ def build_prompt(schema: Dict, examples: List[Dict], user_question: str) -> str:
     return "\n".join(prompt_parts)
 
 
+def format_structure_hints(hints: Dict) -> str:
+    """将结构预测格式化为 prompt 中的自然语言提示。"""
+    lines = []
+    # hints 格式: {"has_join": 0.85, "has_subquery": 0.12, ...}
+    # 只输出高置信度的预测（>0.6），避免噪声
+    feature_desc = {
+        "has_aggregation": "This question likely requires aggregation (COUNT/SUM/AVG/MAX/MIN).",
+        "has_join": "This question likely requires JOIN across multiple tables.",
+        "has_where": "This question likely requires WHERE conditions.",
+        "has_subquery": "This question likely requires a subquery.",
+        "has_groupby": "This question likely requires GROUP BY.",
+        "has_orderby": "This question likely requires ORDER BY.",
+        "has_having": "This question likely requires HAVING.",
+        "has_limit": "This question likely requires LIMIT.",
+        "has_set_op": "This question likely requires set operations (UNION/INTERSECT/EXCEPT).",
+        "has_distinct": "This question likely requires DISTINCT.",
+    }
+    for feat, proba in hints.items():
+        if proba > 0.6 and feat in feature_desc:
+            lines.append(f"- {feature_desc[feat]} (confidence: {proba:.0%})")
+
+    return "\n".join(lines) if lines else "No strong structural predictions."
+
+
 def _quote_if_needed(name: str) -> str:
     """对含空格或特殊字符的标识符加反引号"""
     if " " in name or "-" in name:
@@ -60,7 +105,15 @@ def _quote_if_needed(name: str) -> str:
     return name
 
 
-def format_schema(schema: Dict) -> str:
+def format_schema(schema: Dict, db_path: str = None, include_values: bool = False) -> str:
+    """
+    格式化 schema 为 prompt 文本。
+
+    Args:
+        schema: schema 字典
+        db_path: 数据库路径（用于值检索）
+        include_values: 是否包含枚举列的候选值
+    """
     lines = []
     for table in schema["tables"]:
         table_name = _quote_if_needed(table["name"])
@@ -74,6 +127,13 @@ def format_schema(schema: Dict) -> str:
                 col_info = f"  - {col_name} ({col['type']})"
             if col.get("primary_key"):
                 col_info += " [PK]"
+
+            # 值检索：枚举类型列附加候选值
+            if include_values and db_path and col['type'].upper() in ('TEXT', 'VARCHAR'):
+                values = _fetch_column_values(db_path, table["name"], col["name"], limit=10)
+                if values:
+                    col_info += f" [values: {', '.join(values)}]"
+
             lines.append(col_info)
         lines.append("")
 
@@ -85,6 +145,22 @@ def format_schema(schema: Dict) -> str:
             )
 
     return "\n".join(lines)
+
+
+def _fetch_column_values(db_path: str, table: str, column: str, limit: int = 20) -> list:
+    """从数据库中获取列的 distinct 值（用于值检索）。"""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # 使用参数化查询防注入（表名/列名需要手动验证）
+        query = f"SELECT DISTINCT `{column}` FROM `{table}` WHERE `{column}` IS NOT NULL LIMIT {limit}"
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        return [str(row[0]) for row in rows if row[0]]
+    except Exception:
+        return []
 
 
 def build_prompt_with_cot(schema: Dict, examples: List[Dict], user_question: str) -> str:

@@ -12,7 +12,7 @@ load_dotenv()
 class LLMClient:
     """LLM API 客户端基类"""
 
-    def generate(self, prompt: str, max_tokens: int = 500) -> str:
+    def generate(self, prompt: str) -> str:
         raise NotImplementedError
 
 
@@ -27,7 +27,7 @@ class OpenAIClient(LLMClient):
         self.model = model
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
 
-    def generate(self, prompt: str, max_tokens: int = 500) -> str:
+    def generate(self, prompt: str, max_tokens: int = 500, temperature: float = 0.0) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -35,7 +35,7 @@ class OpenAIClient(LLMClient):
                 {"role": "user", "content": prompt}
             ],
             max_tokens=max_tokens,
-            temperature=0.0
+            temperature=temperature
         )
         return response.choices[0].message.content
 

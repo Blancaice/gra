@@ -29,7 +29,29 @@ def _name_tokens(name: str) -> List[str]:
     return out
 
 
-def _extract_anchor_scores(user_question: str, schema: Dict) -> Dict[str, float]:
+def _extract_anchor_scores(user_question: str, schema: Dict, schema_hints: Dict = None) -> Dict[str, float]:
+    """计算锚点分数。如果有 schema_hints，优先用 LLM 识别的表列作为锚点。"""
+    scores: Dict[str, float] = {}
+
+    # 如果有 schema linking 结果，直接用作高分锚点
+    if schema_hints and schema_hints.get("tables"):
+        linked_tables = {t.lower() for t in schema_hints["tables"]}
+        linked_columns = {}
+        for tname, cols in schema_hints.get("columns", {}).items():
+            linked_columns[tname.lower()] = {c.lower() for c in cols}
+
+        for table in schema.get("tables", []):
+            tname = table.get("name", "")
+            if tname.lower() in linked_tables:
+                scores[tname] = 3.0  # LLM 确认的表，最高分
+                # 有具体列匹配的再加分
+                if tname.lower() in linked_columns:
+                    scores[tname] += 0.5 * len(linked_columns[tname.lower()])
+            else:
+                scores[tname] = 0.0
+        return scores
+
+    # 原始 token 匹配逻辑
     q_tokens = set(_tokenize(user_question))
     scores: Dict[str, float] = {}
 
@@ -73,6 +95,7 @@ def generate_from_schema(
     max_retries: int = 1,
     user_question: str = "",
     examples_per_path: int = 2,
+    schema_hints: Dict = None,
 ) -> List[Dict]:
     """
     Build schema-centric examples with query-guided path sampling.
@@ -81,7 +104,7 @@ def generate_from_schema(
     if not schema.get("tables"):
         return []
 
-    anchor_scores = _extract_anchor_scores(user_question, schema)
+    anchor_scores = _extract_anchor_scores(user_question, schema, schema_hints=schema_hints)
     weighted_graph = build_weighted_graph(schema, schema_graph, anchor_scores)
     sampled_paths = sample_paths_query_guided(
         graph=weighted_graph,

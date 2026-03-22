@@ -1,0 +1,41 @@
+{
+  "llm": {
+    "provider": "openai",
+    "model": "gpt-4o"
+  },
+  "embedding": {
+    "model": "BAAI/bge-base-en-v1.5"
+  },
+  "schema": {
+    "top_k": 5,
+    "max_hops": 2
+  },
+  "examples": {
+    "use_train_retrieval": true,
+    "use_schema_centric": false,
+    "use_structure_aware": false,
+    "train_data_paths": [
+      "data/spider_data/train_spider.json",
+      "data/spider_data/train_others.json"
+    ],
+    "num_question_centric": 5,
+    "schema_centric_num_paths": 3,
+    "schema_centric_examples_per_path": 1
+  },
+  "scoring": {
+    "weights": [0.4, 0.4, 0.2],
+    "dynamic_enabled": true
+  },
+  "schema_linking": {
+    "enabled": true
+  },
+  "generation": {
+    "top_k": 3,
+    "num_candidates": 1,
+    "evaluation_mode": "spider",
+    "token_budget": 2000,
+    "use_diversity": true,
+    "diversity_threshold": 0.3,
+    "mmr_lambda": 0.75
+  }
+}

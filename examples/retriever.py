@@ -140,6 +140,7 @@ def retrieve_schema_centric(
     num_paths: int = 3,
     examples_per_path: int = 2,
     db_path: str = None,
+    schema_hints: Dict = None,
 ) -> List[Dict]:
     """
     Schema-centric: Query-guided Schema Path Sampling + LLM 实时生成。
@@ -153,4 +154,5 @@ def retrieve_schema_centric(
         db_path=db_path,
         user_question=user_question,
         examples_per_path=examples_per_path,
+        schema_hints=schema_hints,
     )

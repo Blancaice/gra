@@ -8,7 +8,7 @@ from typing import Optional, Dict, Set, List, Tuple
 from src.scoring.ast_score import compute_ast_match_score, infer_target_structure
 
 
-def generate_sql(prompt: str, llm_client, evaluation_mode: str = "general") -> str:
+def generate_sql(prompt: str, llm_client, evaluation_mode: str = "general", max_tokens: int = 1024, temperature: float = 0.0) -> str:
     """
     调用 LLM 生成 SQL
 
@@ -19,7 +19,7 @@ def generate_sql(prompt: str, llm_client, evaluation_mode: str = "general") -> s
     Returns:
         生成的 SQL 查询
     """
-    response = llm_client.generate(prompt)
+    response = llm_client.generate(prompt, max_tokens=max_tokens, temperature=temperature)
 
     # 提取 SQL（可能包含在代码块中）
     sql = extract_sql_from_response(response, evaluation_mode=evaluation_mode)
@@ -52,7 +52,8 @@ def generate_sql_candidates(
             + hint
             + "\nReturn only one SQL query."
         )
-        sql = generate_sql(aug_prompt, llm_client, evaluation_mode=evaluation_mode)
+        temp = 0.0 if i == 0 else 0.3
+        sql = generate_sql(aug_prompt, llm_client, evaluation_mode=evaluation_mode, temperature=temp)
         if sql:
             candidates.append(sql)
 
@@ -234,18 +235,16 @@ def rank_sql_candidates(
             exec_ok = execute_sql(sql, db_path) is not None
 
         ast_match = compute_ast_match_score(user_question, sql)
-        simplicity = _simplicity_score(sql)
         structure_bonus = _structure_priority_bonus(sql, target)
 
-        # 规则分：先过约束，再按结构匹配和简洁度排序
+        # 规则分：先过约束，再按结构匹配排序
         score = 0.0
         score += 0.45 * (1.0 if syntax_ok else 0.0)
         score += 0.20 * (1.0 if col_ok else 0.0)
         score += 0.15 * (1.0 if exec_ok else 0.0)
         score += 0.15 * ast_match
-        score += 0.03 * simplicity
         # 结构优先奖励：目标问题需要复杂结构时，优先保留对应候选。
-        score += 0.02 * structure_bonus
+        score += 0.05 * structure_bonus
 
         scored.append({
             "sql": sql,
@@ -254,7 +253,6 @@ def rank_sql_candidates(
             "col_ok": col_ok,
             "exec_ok": exec_ok,
             "ast_match": ast_match,
-            "simplicity": simplicity,
             "structure_bonus": structure_bonus,
             "invalid_items": invalid_items,
         })
@@ -266,13 +264,6 @@ def rank_sql_candidates(
 def execute_sql(sql: str, db_path: str) -> Optional[list]:
     """
     执行 SQL 并返回结果
-
-    Args:
-        sql: SQL 查询
-        db_path: 数据库路径
-
-    Returns:
-        查询结果（列表），如果失败则返回 None
     """
     import sqlite3
 
@@ -288,6 +279,179 @@ def execute_sql(sql: str, db_path: str) -> Optional[list]:
     except Exception as e:
         print(f"SQL execution error: {e}")
         return None
+
+
+def execute_sql_with_error(sql: str, db_path: str) -> Tuple[Optional[list], Optional[str]]:
+    """
+    执行 SQL，返回 (结果, 错误信息)。成功时错误为 None。
+    """
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace")
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        results = cursor.fetchall()
+        conn.close()
+        return results, None
+    except Exception as e:
+        return None, str(e)
+
+
+def repair_sql(
+    sql: str,
+    error_msg: str,
+    user_question: str,
+    schema: Dict,
+    llm_client,
+    evaluation_mode: str = "general",
+) -> str:
+    """
+    根据执行错误让 LLM 修正 SQL。
+    """
+    from src.generation.prompt_builder import format_schema
+
+    schema_str = format_schema(schema)
+    prompt = f"""You are a SQL expert. The following SQL query failed to execute on a SQLite database.
+
+Database Schema:
+{schema_str}
+
+User Question: {user_question}
+
+Failed SQL:
+{sql}
+
+Error Message:
+{error_msg}
+
+Fix the SQL query so it executes correctly. Return ONLY the corrected SQL query, nothing else."""
+
+    try:
+        response = llm_client.generate(prompt)
+        fixed = extract_sql_from_response(response, evaluation_mode=evaluation_mode)
+        return fixed if fixed else sql
+    except Exception as exc:
+        print(f"  SQL repair LLM call failed: {exc}")
+        return sql
+
+
+def verify_column_selection(
+    sql: str,
+    user_question: str,
+    schema: Dict,
+    llm_client,
+    evaluation_mode: str = "general",
+) -> str:
+    """
+    语义自纠正：逐项检查 SQL 是否正确回答了问题，有问题才修，没问题原样返回。
+    """
+    from src.generation.prompt_builder import format_schema
+    schema_str = format_schema(schema)
+
+    prompt = f"""You are a SQL verification expert. Check whether the SQL below correctly answers the question on the given SQLite schema. Fix it ONLY if there is a real semantic error. If it is already correct, return it unchanged.
+
+Database Schema:
+{schema_str}
+
+Question: {user_question}
+
+SQL: {sql}
+
+#### Verification checklist (check each one):
+
+1. **SELECT columns**: Does the question ask for a count/number? Then SELECT must use COUNT(*). Does it ask for names/ids? Then SELECT the right columns. Do NOT return raw rows when the question asks for an aggregate, and vice versa.
+
+2. **Missing JOIN**: Does the query need data from multiple tables? Are ALL necessary tables joined with correct foreign keys? Selecting from a lookup table without joining the main table returns ALL rows instead of only relevant ones.
+
+3. **Hallucinated conditions**: Does every WHERE/HAVING condition correspond to something explicitly stated in the question? Do NOT add extra conditions (like date filters, NULL checks, status filters) that the question never mentioned.
+
+4. **EXCEPT misuse**: EXCEPT operates on row sets with matching columns. Do NOT use `SELECT count(*) ... EXCEPT SELECT count(*) ...` — that compares two numbers, not filtering rows. Use NOT IN or LEFT JOIN ... IS NULL instead.
+
+5. **Condition scoping**: When the question applies different conditions to different items (e.g., "X for type A, and Y for type B"), each condition must only apply to its intended subset. Use UNION if conditions have different scopes, not AND.
+
+6. **GROUP BY correctness**: GROUP BY column must match what the question groups by. GROUP BY name vs GROUP BY id can produce different results.
+
+7. **Aggregation scope**: "the X with the most/least Y" needs correct aggregation scope — per-group vs entire table.
+
+8. **WHERE vs HAVING**: Conditions on aggregated values (count, sum, avg) belong in HAVING, not WHERE.
+
+Return ONLY the corrected SQL query. No explanation."""
+
+    try:
+        response = llm_client.generate(prompt)
+        fixed = extract_sql_from_response(response, evaluation_mode=evaluation_mode)
+        if fixed and fixed.strip():
+            if fixed.strip().upper() != sql.strip().upper():
+                print(f"  Self-correction: fixed SQL")
+            return fixed
+    except Exception as exc:
+        print(f"  Self-correction failed: {exc}")
+
+    return sql
+
+
+def execute_with_repair(
+    sql: str,
+    user_question: str,
+    schema: Dict,
+    db_path: str,
+    llm_client,
+    evaluation_mode: str = "general",
+    max_retries: int = 2,
+    semantic_verify: bool = True,
+    value_check: bool = True,
+) -> Tuple[str, bool]:
+    """
+    执行验证 + 语义自纠正 + 错误修正循环。
+    """
+    from src.generation.value_checker import check_empty_result_and_repair
+
+    current_sql = sql
+
+    # 第一轮：语义验证（开关控制）
+    if semantic_verify:
+        current_sql = verify_column_selection(
+            sql=current_sql,
+            user_question=user_question,
+            schema=schema,
+            llm_client=llm_client,
+            evaluation_mode=evaluation_mode,
+        )
+
+    # 第二轮：执行验证 + 修复
+    for attempt in range(max_retries + 1):
+        results, error = execute_sql_with_error(current_sql, db_path)
+        if error is None:
+            # 零结果自检
+            if value_check:
+                repaired = check_empty_result_and_repair(
+                    current_sql, user_question, schema, db_path, llm_client, evaluation_mode
+                )
+                if repaired:
+                    print("  Empty result detected, checking value alignment...")
+                    current_sql = repaired
+                    continue
+
+            if attempt > 0:
+                print(f"  SQL repair succeeded on attempt {attempt}")
+            return current_sql, True
+
+        if attempt < max_retries:
+            print(f"  SQL execution failed (attempt {attempt + 1}): {error}")
+            current_sql = repair_sql(
+                sql=current_sql,
+                error_msg=error,
+                user_question=user_question,
+                schema=schema,
+                llm_client=llm_client,
+                evaluation_mode=evaluation_mode,
+            )
+        else:
+            print(f"  SQL repair exhausted after {max_retries} retries")
+
+    return current_sql, False
 
 
 def _simplicity_score(sql: str) -> float:
@@ -309,8 +473,9 @@ def postprocess_sql_for_eval(sql: str, evaluation_mode: str = "general") -> str:
     """
     SQL 后处理（带模式开关）：
     1) 单语句、去分号、压缩空白
-    2) 在 spider 模式下：去常见 AS 别名
-    3) 在 spider 模式下：对常见 MIN/MAX 子查询模式做 canonical 重写
+    2) 通用：双引号字符串值 → 单引号（SQLite 兼容）
+    3) 通用：去掉多余的 CAST(col AS INTEGER/REAL) 当列本身是数值类型
+    4) Spider 模式：对常见 MIN/MAX 子查询模式做 canonical 重写
     """
     if not sql:
         return ""
@@ -319,9 +484,24 @@ def postprocess_sql_for_eval(sql: str, evaluation_mode: str = "general") -> str:
     s = sql.strip().split(";")[0].strip()
     s = re.sub(r"\s+", " ", s)
 
-    # 仅在 Spider 评测模式下启用 canonical 技巧，避免影响通用场景。
+    # 双引号包裹的字符串值 → 单引号（避免 SQLite 把它当标识符）
+    # 匹配 = "value" 或 IN ("v1", "v2") 等模式中的双引号字符串
+    s = re.sub(
+        r'(?<=[\s=,(])\"([^"]+?)\"(?=[\s,)\]]|$)',
+        r"'\1'",
+        s,
+    )
+
+    # 去掉多余的 CAST(col AS INTEGER)：直接替换为 col
+    s = re.sub(
+        r'\bCAST\s*\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s+AS\s+(?:INTEGER|REAL|NUMERIC|FLOAT)\s*\)',
+        r'\1',
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # 仅在 Spider 评测模式下启用 canonical 技巧
     if (evaluation_mode or "general").lower() == "spider":
-        # 重写 MIN/MAX 子查询到 ORDER BY LIMIT 形式（Spider 中更常见）
         s = _rewrite_minmax_subquery(s)
     return s
 
