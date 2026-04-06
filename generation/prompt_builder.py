@@ -39,8 +39,8 @@ def build_prompt(schema: Dict, examples: List[Dict], user_question: str,
         " it refers to values that exist in the data, not literal strings. You must JOIN tables to resolve such references.\n"
         "15) For exclusion (not in X), use NOT IN with a subquery.\n"
         "16) For set operations (both X and Y), use INTERSECT only when combining two complete SELECT queries.\n"
-        "17) IMPORTANT: If a table or column name contains spaces or special characters, "
-        "wrap it in backticks.\n"
+        "17) CRITICAL: If a table or column name contains spaces, special characters, or is a SQL keyword, "
+        "you MUST wrap it in backticks. Check the schema above for names with spaces.\n"
     )
 
     prompt_parts.append("# Database Schema\n")

@@ -19,7 +19,7 @@
       "data/spider_data/train_others.json"
     ],
     "num_question_centric": 5,
-    "num_structure_aware": 10,
+    "num_structure_aware": 8,
     "structure_alpha": 0.4,
     "semantic_candidates": 200,
     "cache_dir": "data/cache",
@@ -39,7 +39,7 @@
     "value_check": false,
     "num_candidates": 1,
     "evaluation_mode": "spider",
-    "token_budget": 2000,
+    "token_budget": 3000,
     "use_diversity": true,
     "diversity_threshold": 0.3,
     "mmr_lambda": 0.75
