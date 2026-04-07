@@ -78,7 +78,7 @@ def extract_schema(db_path: str, tables_json_path: str = None) -> Dict:
         }
 
         # 获取表的列信息
-        cursor.execute(f"PRAGMA table_info({table_name})")
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
         columns = cursor.fetchall()
 
         for col in columns:
@@ -96,7 +96,7 @@ def extract_schema(db_path: str, tables_json_path: str = None) -> Dict:
             table_info['columns'].append(col_data)
 
         # 获取外键信息
-        cursor.execute(f"PRAGMA foreign_key_list({table_name})")
+        cursor.execute(f'PRAGMA foreign_key_list("{table_name}")')
         fks = cursor.fetchall()
 
         for fk in fks:
@@ -133,6 +133,10 @@ def build_schema_graph(schema: Dict) -> Dict:
     for fk in schema['foreign_keys']:
         from_table = fk['from_table']
         to_table = fk['to_table']
+
+        # 跳过引用了不存在表的外键（大小写不一致等情况）
+        if from_table not in graph or to_table not in graph:
+            continue
 
         if to_table not in graph[from_table]:
             graph[from_table].append(to_table)

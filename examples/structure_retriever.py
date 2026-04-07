@@ -49,11 +49,17 @@ AGG_MAP = {0: "none", 1: "max", 2: "min", 3: "count", 4: "sum", 5: "avg"}
 # 1. SQL 结构特征提取（从 Spider 解析字段）
 # ============================================================
 
-def extract_structure_features(sql_parsed: Dict) -> np.ndarray:
+def extract_structure_features(sql_parsed) -> np.ndarray:
     """
-    从 Spider 的 sql 解析字段提取 10 维二值结构向量。
+    提取 10 维二值结构向量。
+    支持两种输入：
+    - Spider 解析字典 {"select": [...], "from": {...}, ...}
+    - 原始 SQL 字符串（BIRD 格式）
     """
-    f = _extract_features_dict(sql_parsed)
+    if isinstance(sql_parsed, str):
+        f = _extract_features_from_raw_sql(sql_parsed)
+    else:
+        f = _extract_features_dict(sql_parsed)
     return np.array([
         int(f["has_aggregation"]),
         int(f["has_join"]),
@@ -66,6 +72,36 @@ def extract_structure_features(sql_parsed: Dict) -> np.ndarray:
         int(f["has_set_op"]),
         int(f["has_distinct"]),
     ], dtype=np.float32)
+
+
+def _extract_features_from_raw_sql(sql: str) -> Dict:
+    """从原始 SQL 字符串用正则提取结构特征（适配 BIRD 等无解析字段的数据集）"""
+    import re
+    f = {k: False for k in FEATURE_NAMES}
+    if not sql:
+        return f
+    sql_upper = sql.upper()
+    # aggregation
+    f["has_aggregation"] = bool(re.search(r'\b(COUNT|SUM|AVG|MAX|MIN)\s*\(', sql_upper))
+    # join
+    f["has_join"] = bool(re.search(r'\bJOIN\b', sql_upper))
+    # where
+    f["has_where"] = bool(re.search(r'\bWHERE\b', sql_upper))
+    # subquery: SELECT 出现超过1次
+    f["has_subquery"] = sql_upper.count('SELECT') > 1
+    # group by
+    f["has_groupby"] = bool(re.search(r'\bGROUP\s+BY\b', sql_upper))
+    # order by
+    f["has_orderby"] = bool(re.search(r'\bORDER\s+BY\b', sql_upper))
+    # having
+    f["has_having"] = bool(re.search(r'\bHAVING\b', sql_upper))
+    # limit
+    f["has_limit"] = bool(re.search(r'\bLIMIT\b', sql_upper))
+    # set operations
+    f["has_set_op"] = bool(re.search(r'\b(UNION|INTERSECT|EXCEPT)\b', sql_upper))
+    # distinct
+    f["has_distinct"] = bool(re.search(r'\bDISTINCT\b', sql_upper))
+    return f
 
 
 def _extract_features_dict(sql_parsed: Dict) -> Dict:
@@ -200,7 +236,8 @@ class StructureAwareRetriever:
             print("  Extracting structure features from SQL...")
             vecs = []
             for item in train_data:
-                sql_parsed = item.get("sql", {})
+                # Spider: "sql" 是解析字典；BIRD: "SQL" 是原始字符串
+                sql_parsed = item.get("sql", item.get("SQL", {}))
                 vec = extract_structure_features(sql_parsed)
                 vecs.append(vec)
             self.train_structure_vectors = np.array(vecs, dtype=np.float32)
@@ -352,9 +389,11 @@ class StructureAwareRetriever:
             combined_score = alpha * struct_sim + (1 - alpha) * semantic_sim
 
             item = self.train_data[idx]
+            # Spider: "query"; BIRD: "SQL"
+            sql_text = item.get("query", item.get("SQL", ""))
             candidates.append({
                 "question": item.get("question", ""),
-                "sql": item.get("query", ""),
+                "sql": sql_text,
                 "db_id": item.get("db_id", ""),
                 "source": "structure_aware",
                 "token_count": len(item.get("question", "")) // 4 + len(item.get("query", "")) // 4 + 20,

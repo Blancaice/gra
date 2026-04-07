@@ -326,6 +326,7 @@ Failed SQL:
 Error Message:
 {error_msg}
 
+IMPORTANT: If a table or column name contains spaces or special characters, wrap it in backticks.
 Fix the SQL query so it executes correctly. Return ONLY the corrected SQL query, nothing else."""
 
     try:

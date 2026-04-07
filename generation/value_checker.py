@@ -30,7 +30,7 @@ def get_actual_values(db_path: str, table: str, column: str, limit: int = 10) ->
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute(f"SELECT DISTINCT {column} FROM {table} LIMIT {limit}")
+        cursor.execute(f'SELECT DISTINCT "{column}" FROM "{table}" LIMIT {limit}')
         results = [str(row[0]) for row in cursor.fetchall() if row[0] is not None]
         conn.close()
         return results

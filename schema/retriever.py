@@ -24,6 +24,7 @@ def retrieve_relevant_schema(
     双通道召回：
     1. Embedding 相似度检索 top-k 列 → 对应表
     2. 名词短语直接匹配表名（零成本，高精度）
+    3. Evidence 中列名/表名直接匹配（BIRD 数据集关键）
     合并后再做外键路径拓展。
     """
     # 1. 向量化问题 → embedding 检索
@@ -42,18 +43,81 @@ def retrieve_relevant_schema(
         if noun_matched:
             relevant_tables |= noun_matched
 
-    # 3. 小型数据库（≤6 表）直接用全部表，避免漏表
+    # 3. Evidence 中的列名/表名直接匹配（BIRD 关键：evidence 经常包含 column = value）
+    evidence_matched = _match_tables_by_evidence(question, schema)
+    if evidence_matched:
+        relevant_tables |= evidence_matched
+
+    # 4. 小型数据库（≤6 表）直接用全部表，避免漏表
     all_table_names = {t["name"] for t in schema.get("tables", [])}
     if len(all_table_names) <= 6:
         relevant_tables = all_table_names
 
-    # 4. 路径拓展：添加通过外键关联的表
+    # 5. 路径拓展：添加通过外键关联的表
     expanded_tables = expand_tables(relevant_tables, schema_graph)
 
-    # 5. 构建裁剪后的 Schema
+    # 6. 构建裁剪后的 Schema
     pruned_schema = build_pruned_schema(expanded_tables, schema)
 
     return pruned_schema
+
+
+def _match_tables_by_evidence(question: str, schema: Dict) -> Set[str]:
+    """
+    从 question（含 Evidence）中提取列名/表名，直接匹配 schema。
+
+    BIRD 的 evidence 常包含 'column_name = value' 或 'refers to table.column' 等线索，
+    这些是非常强的 schema 信号。
+    """
+    matched = set()
+
+    # 提取 Evidence 部分
+    evidence = ""
+    if "\nEvidence:" in question:
+        evidence = question.split("\nEvidence:", 1)[1].strip()
+    full_text = (question + " " + evidence).lower()
+
+    # 构建列名→表名的映射
+    col_to_tables: Dict[str, Set[str]] = {}
+    table_names_lower: Dict[str, str] = {}
+    for table in schema.get("tables", []):
+        tname = table["name"]
+        table_names_lower[tname.lower()] = tname
+        for col in table.get("columns", []):
+            cname = col["name"].lower()
+            if cname not in col_to_tables:
+                col_to_tables[cname] = set()
+            col_to_tables[cname].add(tname)
+
+    # 1. 匹配 evidence 中的 column = 'value' 模式
+    for m in re.finditer(r'(\w+)\s*=\s*[\'"]', full_text):
+        col_name = m.group(1).lower()
+        if col_name in col_to_tables:
+            matched |= col_to_tables[col_name]
+
+    # 2. 匹配 table.column 模式
+    for m in re.finditer(r'(\w+)\.(\w+)', full_text):
+        tname = m.group(1).lower()
+        cname = m.group(2).lower()
+        if tname in table_names_lower:
+            matched.add(table_names_lower[tname])
+        if cname in col_to_tables:
+            matched |= col_to_tables[cname]
+
+    # 3. 匹配 "refers to column_name" 模式
+    for m in re.finditer(r'refers to\s+(\w+)', full_text):
+        token = m.group(1).lower()
+        if token in col_to_tables:
+            matched |= col_to_tables[token]
+        if token in table_names_lower:
+            matched.add(table_names_lower[token])
+
+    # 4. 直接扫描所有列名是否出现在文本中（仅匹配有区分度的列名，长度>3）
+    for col_name, tables in col_to_tables.items():
+        if len(col_name) > 3 and re.search(r'\b' + re.escape(col_name) + r'\b', full_text):
+            matched |= tables
+
+    return matched
 
 
 def _match_tables_by_noun_phrases(noun_phrases: List[str], schema: Dict) -> Set[str]:
